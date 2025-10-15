@@ -7,14 +7,15 @@ CSV -> Precisely sized PDF tables
 Small table: 2.5" x 3.0" (Range, Elev, 5mph, 10mph)
 Large table: 5.0" x 3.0"
   - Top row: Range headers
-  - Column 0: mph integers (2..20) rotated 90° CCW; ~0.22" wide
+  - Column 0: mph integers generated from available wind data; rotated 90° CCW; ~0.22" wide
   - Single input: one value per cell
   - Two inputs: stacked red (data1) over blue (data2) per cell
 """
 
 import csv
 import sys
-from typing import List
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas as rl_canvas
@@ -25,8 +26,6 @@ from reportlab.platypus import Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # ----- Constants (tweakable) -----
-MPH_COLUMNS = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-
 PAGE_W_IN, PAGE_H_IN = 8.5, 11.0
 MARGIN_LR_IN = 0.5
 MARGIN_TB_IN = 0.5
@@ -43,15 +42,54 @@ def format_range(v: str) -> str:
     except (ValueError, TypeError):
         return v
 
-def format_one_decimal(v: str) -> str:
-    try:
-        return f"{float(v):.1f}"
-    except (ValueError, TypeError):
-        return v
+def format_optional_one_decimal(v: Optional[float]) -> str:
+    if v is None:
+        return ""
+    return f"{v:.1f}"
 
-def read_csv_rows(csv_path: str) -> List[List[str]]:
-    required = ["Range", "Elev", "5mph", "10mph"]
-    rows: List[List[str]] = []
+@dataclass
+class WindRow:
+    range_label: str
+    elevation: Optional[float]
+    winds: Dict[int, float]
+
+
+@dataclass
+class WindDataset:
+    rows: List[WindRow]
+    mph_values: List[int]
+
+
+def _parse_wind_columns(fieldnames: Sequence[str]) -> List[Tuple[int, str]]:
+    wind_columns: List[Tuple[int, str]] = []
+    for name in fieldnames:
+        lower = name.lower()
+        if lower.endswith("mph") and lower not in {"range", "elev"}:
+            prefix = lower[:-3].strip()
+            try:
+                mph = int(prefix)
+            except ValueError:
+                continue
+            wind_columns.append((mph, name))
+    wind_columns.sort(key=lambda x: x[0])
+    return wind_columns
+
+
+def _parse_float(value: str) -> Optional[float]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def read_csv_rows(csv_path: str) -> WindDataset:
+    required = ["Range", "Elev"]
+    rows: List[WindRow] = []
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
@@ -59,14 +97,112 @@ def read_csv_rows(csv_path: str) -> List[List[str]]:
         for key in required:
             if key not in reader.fieldnames:
                 raise ValueError(f"Missing required column: {key!r}")
+        wind_columns = _parse_wind_columns(reader.fieldnames)
+        if not wind_columns:
+            raise ValueError("CSV must contain at least one wind speed column ending with 'mph'")
         for rec in reader:
-            rows.append([
-                format_range(rec["Range"]),
-                format_one_decimal(rec["Elev"]),
-                format_one_decimal(rec["5mph"]),
-                format_one_decimal(rec["10mph"]),
-            ])
-    return rows
+            winds: Dict[int, float] = {}
+            for mph, col in wind_columns:
+                value = _parse_float(rec.get(col))
+                if value is not None:
+                    winds[mph] = value
+            rows.append(WindRow(
+                range_label=format_range(rec["Range"]),
+                elevation=_parse_float(rec["Elev"]),
+                winds=winds,
+            ))
+    mph_values = sorted({mph for mph, _ in wind_columns})
+    return WindDataset(rows=rows, mph_values=mph_values)
+
+
+def interpolate_wind_value(row: WindRow, target_mph: int) -> Optional[float]:
+    if target_mph in row.winds:
+        return row.winds[target_mph]
+    if not row.winds:
+        return None
+    sorted_mphs = sorted(row.winds.keys())
+    if target_mph < sorted_mphs[0] or target_mph > sorted_mphs[-1]:
+        return None
+    if target_mph == sorted_mphs[0]:
+        return row.winds[sorted_mphs[0]]
+    if target_mph == sorted_mphs[-1]:
+        return row.winds[sorted_mphs[-1]]
+    lower_mph = None
+    upper_mph = None
+    for mph in sorted_mphs:
+        if mph < target_mph:
+            lower_mph = mph
+        elif mph > target_mph:
+            upper_mph = mph
+            break
+        else:
+            return row.winds[mph]
+    if lower_mph is None or upper_mph is None:
+        return None
+    lower_val = row.winds[lower_mph]
+    upper_val = row.winds[upper_mph]
+    if lower_val is None or upper_val is None or upper_mph == lower_mph:
+        return None
+    ratio = (target_mph - lower_mph) / (upper_mph - lower_mph)
+    return lower_val + (upper_val - lower_val) * ratio
+
+
+def generate_large_mph_columns(*mph_lists: Sequence[int]) -> List[int]:
+    available = sorted({mph for lst in mph_lists for mph in lst})
+    if not available:
+        raise ValueError("No wind speed columns available to generate large chart headers")
+    start = available[0]
+    end = max(max(available), 16)
+
+    def build(step: int) -> List[int]:
+        mphs = list(range(start, end + 1, step))
+        if mphs[-1] != end:
+            mphs.append(end)
+        if mphs[0] != start:
+            mphs.insert(0, start)
+        return sorted(set(mphs))
+
+    mphs = build(2)
+    if len(mphs) < 8:
+        mphs = build(1)
+    step = 2
+    while len(mphs) > 10 and step < (end - start + 1):
+        step += 1
+        mphs = build(step)
+
+    if len(mphs) > 10:
+        # Down-sample while preserving endpoints
+        desired = 10
+        full = mphs
+        result = [full[0]]
+        for i in range(1, desired - 1):
+            pos = i * (len(full) - 1) / (desired - 1)
+            idx = round(pos)
+            idx = max(0, min(idx, len(full) - 1))
+            candidate = full[idx]
+            if candidate <= result[-1] and idx < len(full) - 1:
+                idx += 1
+                candidate = full[idx]
+            result.append(candidate)
+        result.append(full[-1])
+        # Remove potential duplicates while keeping order
+        deduped: List[int] = []
+        for val in result:
+            if not deduped or deduped[-1] != val:
+                deduped.append(val)
+        mphs = deduped
+
+    if len(mphs) < 8:
+        full_range = list(range(start, end + 1))
+        for mph in full_range:
+            if mph not in mphs:
+                mphs.append(mph)
+                mphs.sort()
+                if len(mphs) >= 8:
+                    break
+    if len(mphs) < 8:
+        raise ValueError("Unable to generate at least 8 wind columns from available data range")
+    return mphs[:10]
 
 # ----- Fit helpers -----
 def _max_line_width(text: str, font_name="Helvetica") -> float:
@@ -103,21 +239,31 @@ def shrink_to_fit_font_size_excluding_first_col(table_data, col_widths, row_heig
     return max(min_font, size)
 
 # ----- Builders -----
-def small_table_data(rows: List[List[str]]):
-    return [["Range", "Elev", "5mph", "10mph"]] + rows
+SMALL_WIND_COLUMNS = [5, 10]
 
-def mph_values_from_10(m10: str, mph: int) -> str:
-    try:
-        base = float(m10)
-    except (ValueError, TypeError):
-        base = 0.0
-    return f"{base * (mph/10.0):.1f}"
 
-def large_single_data(rows: List[List[str]]):
-    header = [""] + [r[0] for r in rows]
+def wind_value_string(row: WindRow, mph: int) -> str:
+    value = interpolate_wind_value(row, mph)
+    return format_optional_one_decimal(value)
+
+
+def small_table_data(dataset: WindDataset):
+    header = ["Range", "Elev"] + [f"{mph}mph" for mph in SMALL_WIND_COLUMNS]
+    table_rows = []
+    for row in dataset.rows:
+        table_rows.append([
+            row.range_label,
+            format_optional_one_decimal(row.elevation),
+            *[wind_value_string(row, mph) for mph in SMALL_WIND_COLUMNS],
+        ])
+    return [header] + table_rows
+
+
+def large_single_data(dataset: WindDataset, mph_columns: Sequence[int]):
+    header = [""] + [r.range_label for r in dataset.rows]
     body = []
-    for m in MPH_COLUMNS:
-        body.append([str(m)] + [mph_values_from_10(r[3], m) for r in rows])
+    for mph in mph_columns:
+        body.append([str(mph)] + [wind_value_string(r, mph) for r in dataset.rows])
     return [header] + body
 
 styles = getSampleStyleSheet()
@@ -132,17 +278,17 @@ STACK_STYLE = ParagraphStyle(
     spaceAfter=0,
 )
 
-def large_combined_data(rows1: List[List[str]], rows2: List[List[str]]):
-    header = [""] + [r[0] for r in rows1]
+def large_combined_data(dataset1: WindDataset, dataset2: WindDataset, mph_columns: Sequence[int]):
+    header = [""] + [r.range_label for r in dataset1.rows]
     body = []
-    for m in MPH_COLUMNS:
-        row = [str(m)]
-        for r1, r2 in zip(rows1, rows2):
-            a = mph_values_from_10(r1[3], m)
-            b = mph_values_from_10(r2[3], m)
+    for mph in mph_columns:
+        row_cells = [str(mph)]
+        for r1, r2 in zip(dataset1.rows, dataset2.rows):
+            a = wind_value_string(r1, mph)
+            b = wind_value_string(r2, mph)
             html = f'<font color="#CC0000">{a}</font><br/><font color="#0033CC">{b}</font>'
-            row.append(Paragraph(html, STACK_STYLE))
-        body.append(row)
+            row_cells.append(Paragraph(html, STACK_STYLE))
+        body.append(row_cells)
     return [header] + body
 
 # ----- Table factories -----
@@ -198,10 +344,14 @@ def draw_table(c: rl_canvas.Canvas, t: Table, x_in: float, y_in: float):
     c.restoreState()
 
 def render_single(csv1: str, out_pdf: str):
-    rows1 = read_csv_rows(csv1)
-    t_s1 = make_fixed_size_table(small_table_data(rows1), SMALL_W_IN, SMALL_H_IN)
-    t_s2 = make_fixed_size_table(small_table_data(rows1), SMALL_W_IN, SMALL_H_IN)
-    t_L  = make_fixed_size_table(large_single_data(rows1), LARGE_W_IN, LARGE_H_IN,
+    dataset1 = read_csv_rows(csv1)
+    small_data = small_table_data(dataset1)
+    mph_columns = generate_large_mph_columns(dataset1.mph_values)
+    large_data = large_single_data(dataset1, mph_columns)
+
+    t_s1 = make_fixed_size_table(small_data, SMALL_W_IN, SMALL_H_IN)
+    t_s2 = make_fixed_size_table(small_data, SMALL_W_IN, SMALL_H_IN)
+    t_L  = make_fixed_size_table(large_data, LARGE_W_IN, LARGE_H_IN,
                                  grid_width=0.75, rotate_first_col=True, lines_per_cell=1)
 
     c = rl_canvas.Canvas(out_pdf, pagesize=letter)
@@ -220,15 +370,20 @@ def render_single(csv1: str, out_pdf: str):
     c.save()
 
 def render_dual(csv1: str, csv2: str, out_pdf: str):
-    rows1 = read_csv_rows(csv1)
-    rows2 = read_csv_rows(csv2)
+    dataset1 = read_csv_rows(csv1)
+    dataset2 = read_csv_rows(csv2)
 
-    t_s1a = make_fixed_size_table(small_table_data(rows1), SMALL_W_IN, SMALL_H_IN)
-    t_s1b = make_fixed_size_table(small_table_data(rows1), SMALL_W_IN, SMALL_H_IN)
-    t_s2a = make_fixed_size_table(small_table_data(rows2), SMALL_W_IN, SMALL_H_IN)
-    t_s2b = make_fixed_size_table(small_table_data(rows2), SMALL_W_IN, SMALL_H_IN)
+    small1 = small_table_data(dataset1)
+    small2 = small_table_data(dataset2)
+    mph_columns = generate_large_mph_columns(dataset1.mph_values, dataset2.mph_values)
+    large_combined = large_combined_data(dataset1, dataset2, mph_columns)
 
-    t_Lc  = make_fixed_size_table(large_combined_data(rows1, rows2), LARGE_W_IN, LARGE_H_IN,
+    t_s1a = make_fixed_size_table(small1, SMALL_W_IN, SMALL_H_IN)
+    t_s1b = make_fixed_size_table(small1, SMALL_W_IN, SMALL_H_IN)
+    t_s2a = make_fixed_size_table(small2, SMALL_W_IN, SMALL_H_IN)
+    t_s2b = make_fixed_size_table(small2, SMALL_W_IN, SMALL_H_IN)
+
+    t_Lc  = make_fixed_size_table(large_combined, LARGE_W_IN, LARGE_H_IN,
                                   grid_width=0.75, rotate_first_col=True, lines_per_cell=2)
 
     c = rl_canvas.Canvas(out_pdf, pagesize=letter)
